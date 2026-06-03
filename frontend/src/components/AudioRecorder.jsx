@@ -26,7 +26,8 @@ export default function AudioRecorder({
   const [audioUploading, setAudioUploading] = useState(false);
   const [audioError, setAudioError]         = useState('');
   const [audioDone, setAudioDone]           = useState(false);
-  const [audioLang, setAudioLang]           = useState('en-US');
+  const [audioLang, setAudioLang]             = useState('en-US');
+  const [audioDuration, setAudioDuration]     = useState(null);
   const [isDraggingAudio, setIsDraggingAudio] = useState(false);
   const audioInputRef = useRef(null);
 
@@ -43,9 +44,36 @@ export default function AudioRecorder({
     'video/mp4', 'audio/webm', 'video/webm', 'audio/aac',
   ];
 
+  const MAX_AUDIO_DURATION_SEC = 8 * 60 * 60;
+
   const formatBytes = (b) => b < 1024 * 1024
     ? `${(b / 1024).toFixed(1)} KB`
     : `${(b / (1024 * 1024)).toFixed(1)} MB`;
+
+  const formatDuration = (sec) => {
+    if (!sec || !Number.isFinite(sec)) return null;
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m ${String(s).padStart(2, '0')}s`;
+  };
+
+  const probeAudioDuration = (file) => new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const audio = new Audio();
+    audio.preload = 'metadata';
+    audio.onloadedmetadata = () => {
+      URL.revokeObjectURL(url);
+      const d = audio.duration;
+      resolve(Number.isFinite(d) && d > 0 ? d : null);
+    };
+    audio.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(null);
+    };
+    audio.src = url;
+  });
 
   const recRef    = useRef(null);
   const timerRef  = useRef(null);
@@ -188,15 +216,33 @@ export default function AudioRecorder({
   };
 
   // ── Audio file upload handlers ────────────────────────────────────
-  const selectAudioFile = (file) => {
+  const selectAudioFile = async (file) => {
     if (!file) return;
+    setAudioError('');
     if (file.size > 500 * 1024 * 1024) {
       setAudioError('File exceeds 500 MB. Please trim your recording and try again.');
       return;
     }
-    setAudioFile(file);
-    setAudioError('');
-    setAudioDone(false);
+
+    try {
+      const probed = await probeAudioDuration(file);
+      if (probed && probed > MAX_AUDIO_DURATION_SEC) {
+        setAudioError(
+          `Audio is ${formatDuration(probed)} long. Maximum allowed duration is 8 hours.`,
+        );
+        setAudioFile(null);
+        setAudioDuration(null);
+        return;
+      }
+
+      setAudioFile(file);
+      setAudioDuration(probed);
+      setAudioDone(false);
+    } catch (e) {
+      setAudioError(e.message || 'Could not load audio file.');
+      setAudioFile(null);
+      setAudioDuration(null);
+    }
   };
 
   const handleAudioInput  = (e) => selectAudioFile(e.target.files[0]);
@@ -208,6 +254,7 @@ export default function AudioRecorder({
 
   const removeAudio = () => {
     setAudioFile(null);
+    setAudioDuration(null);
     setAudioError('');
     setAudioDone(false);
     if (audioInputRef.current) audioInputRef.current.value = '';
@@ -222,8 +269,17 @@ export default function AudioRecorder({
       formData.append('audio', audioFile);
       formData.append('lang', audioLang);
 
-      const res  = await fetch('/api/transcribe', { method: 'POST', body: formData });
-      const data = await res.json();
+      const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        throw new Error(
+          res.ok
+            ? 'Invalid response from server.'
+            : 'Transcription failed. Is the backend running on port 3001?',
+        );
+      }
       if (!res.ok) throw new Error(data.error || 'Transcription failed.');
 
       onTranscriptChange(data.text || '');
@@ -474,7 +530,7 @@ export default function AudioRecorder({
                 <div className="doc-dropzone-icon">🎵</div>
                 <p className="doc-dropzone-title">Drop an audio file or click to browse</p>
                 <p className="doc-dropzone-sub">MP3 · WAV · M4A · OGG · FLAC · WebM · MP4</p>
-                <p className="doc-dropzone-sub" style={{ opacity: 0.5, fontSize: '11px' }}>Max 500 MB · Large files auto-compressed · Powered by Groq Whisper</p>
+                <p className="doc-dropzone-sub" style={{ opacity: 0.5, fontSize: '11px' }}>Up to 8 hours · Max 500 MB · Long recordings split automatically · Groq Whisper</p>
                 <input
                   ref={audioInputRef}
                   type="file"
@@ -488,7 +544,9 @@ export default function AudioRecorder({
                 <div className="doc-loading-spinner" />
                 <p>Transcribing <strong>{audioFile.name}</strong> via Groq Whisper…</p>
                 <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
-                  This may take 15–60 seconds depending on file length.
+                  {audioDuration
+                    ? `${formatDuration(audioDuration)} of audio — may take several minutes for long files.`
+                    : 'This may take a minute for short files, or several minutes for long recordings.'}
                 </p>
               </div>
             ) : (
@@ -499,6 +557,7 @@ export default function AudioRecorder({
                     <p className="doc-success-name">{audioFile.name}</p>
                     <p className="doc-success-chars">
                       {formatBytes(audioFile.size)}
+                      {audioDuration ? ` · ${formatDuration(audioDuration)}` : ''}
                       {audioDone ? ' · Transcribed ✓ — see Transcript tab' : ' · Ready to transcribe'}
                     </p>
                   </div>

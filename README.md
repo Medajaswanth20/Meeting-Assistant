@@ -7,7 +7,7 @@
 ## ✨ Features
 
 - 🎙️ **Live Audio Recording** — Record meetings directly in the browser
-- 📁 **Audio File Upload** — Upload pre-recorded audio (up to 500MB, auto-compressed)
+- 📁 **Audio File Upload** — Upload pre-recorded audio (up to 8 hours / 500MB, auto-compressed & chunked)
 - 📝 **Auto Transcription** — Speech-to-text powered by **Groq Whisper**
 - 🤖 **AI Analysis** — Extract key points, decisions, action items & risks via **LLaMA 3.3 70B**
 - 📄 **Document Upload** — Attach reference documents (PDF, Word, Excel) for additional context

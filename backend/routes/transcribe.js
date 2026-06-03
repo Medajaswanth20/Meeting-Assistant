@@ -1,27 +1,26 @@
-const express        = require('express');
-const multer         = require('multer');
-const Groq           = require('groq-sdk');
-const fs             = require('fs');
-const path           = require('path');
-const os             = require('os');
-const ffmpeg         = require('fluent-ffmpeg');
-const ffmpegStatic   = require('ffmpeg-static');
+const express      = require('express');
+const multer       = require('multer');
+const Groq         = require('groq-sdk');
+const fs           = require('fs');
+const path         = require('path');
+const os           = require('os');
+const { spawn }    = require('child_process');
+const ffmpeg       = require('fluent-ffmpeg');
+const ffmpegStatic = require('ffmpeg-static');
 
-// Point fluent-ffmpeg to the bundled binary (no system install needed)
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
 const router = express.Router();
 
-// Accept up to 500 MB so large recordings aren't rejected at the HTTP layer
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 500 * 1024 * 1024 },
 });
 
-// Groq Whisper hard limit
-const GROQ_MAX_BYTES = 24 * 1024 * 1024; // 24 MB (leave 1 MB headroom)
+const GROQ_MAX_BYTES     = 24 * 1024 * 1024;
+const MAX_DURATION_SEC   = 8 * 60 * 60;
+const CHUNK_DURATION_SEC = 90 * 60;
 
-// BCP-47 → ISO-639-1 mapping for Whisper
 const LANG_MAP = {
   'en-US': 'en',
   'hi-IN': 'hi',
@@ -29,7 +28,6 @@ const LANG_MAP = {
   'te-IN': 'te',
 };
 
-// MIME → extension map
 const MIME_EXT = {
   'audio/mpeg':   '.mp3',
   'audio/mp3':    '.mp3',
@@ -56,17 +54,54 @@ function resolveExt(file) {
   return MIME_EXT[file.mimetype] || '.webm';
 }
 
-/**
- * Compress audio to 32 kbps mono MP3 using ffmpeg-static.
- * Returns the path to the compressed temp file.
- */
-function compressAudio(inputPath) {
+function parseDurationFromFfmpegStderr(stderr) {
+  const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  if (!match) return null;
+  return (
+    parseInt(match[1], 10) * 3600 +
+    parseInt(match[2], 10) * 60 +
+    parseFloat(match[3])
+  );
+}
+
+function getDurationViaFfmpeg(filePath) {
   return new Promise((resolve, reject) => {
-    const outPath = inputPath.replace(/\.[^.]+$/, '_compressed.mp3');
+    const proc = spawn(ffmpegStatic, ['-i', filePath, '-f', 'null', '-'], {
+      windowsHide: true,
+    });
+    let stderr = '';
+    proc.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    proc.on('close', () => {
+      const seconds = parseDurationFromFfmpegStderr(stderr);
+      if (seconds == null) return reject(new Error('Could not read audio duration.'));
+      resolve(seconds);
+    });
+    proc.on('error', reject);
+  });
+}
+
+function getDuration(filePath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, async (err, metadata) => {
+      if (!err && metadata?.format?.duration) {
+        return resolve(metadata.format.duration);
+      }
+      try {
+        resolve(await getDurationViaFfmpeg(filePath));
+      } catch (fallbackErr) {
+        reject(err || fallbackErr);
+      }
+    });
+  });
+}
+
+function compressAudio(inputPath) {
+  const outPath = inputPath.replace(/\.[^.]+$/, '_compressed.mp3');
+  return new Promise((resolve, reject) => {
     ffmpeg(inputPath)
-      .audioChannels(1)          // mono
-      .audioBitrate('32k')       // 32 kbps – enough for speech
-      .audioFrequency(16000)     // 16 kHz – Whisper's native rate
+      .audioChannels(1)
+      .audioBitrate('32k')
+      .audioFrequency(16000)
       .format('mp3')
       .on('error', reject)
       .on('end', () => resolve(outPath))
@@ -74,8 +109,71 @@ function compressAudio(inputPath) {
   });
 }
 
+function extractSegment(inputPath, startSec, durationSec, outPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputPath)
+      .setStartTime(startSec)
+      .duration(durationSec)
+      .outputOptions('-c copy')
+      .on('error', () => {
+        ffmpeg(inputPath)
+          .setStartTime(startSec)
+          .duration(durationSec)
+          .audioChannels(1)
+          .audioBitrate('32k')
+          .audioFrequency(16000)
+          .format('mp3')
+          .on('error', reject)
+          .on('end', () => resolve(outPath))
+          .save(outPath);
+      })
+      .on('end', () => resolve(outPath))
+      .save(outPath);
+  });
+}
+
+async function splitIntoChunks(compressedPath, tmpFiles) {
+  const duration = await getDuration(compressedPath);
+  const chunks = [];
+  let start = 0;
+  let index = 0;
+
+  while (start < duration - 0.5) {
+    const segDuration = Math.min(CHUNK_DURATION_SEC, duration - start);
+    const outPath = path.join(
+      os.tmpdir(),
+      `rec_chunk_${Date.now()}_${index}.mp3`,
+    );
+    await extractSegment(compressedPath, start, segDuration, outPath);
+    tmpFiles.push(outPath);
+
+    const size = fs.statSync(outPath).size;
+    if (size > GROQ_MAX_BYTES) {
+      throw new Error(
+        `Internal error: chunk ${index + 1} is ${(size / 1024 / 1024).toFixed(0)} MB (limit 25 MB).`,
+      );
+    }
+
+    chunks.push(outPath);
+    start += CHUNK_DURATION_SEC;
+    index++;
+  }
+
+  return chunks;
+}
+
+async function transcribeFile(groq, filePath, langCode) {
+  const result = await groq.audio.transcriptions.create({
+    file:            fs.createReadStream(filePath),
+    model:           'whisper-large-v3',
+    language:        langCode,
+    response_format: 'json',
+  });
+  return (result.text || '').trim();
+}
+
 router.post('/', upload.single('audio'), async (req, res) => {
-  const tmpFiles = [];                  // track all temp files for cleanup
+  const tmpFiles = [];
 
   const cleanup = () => {
     for (const f of tmpFiles) {
@@ -89,47 +187,76 @@ router.post('/', upload.single('audio'), async (req, res) => {
     const groq     = new Groq({ apiKey: process.env.GROQ_API_KEY });
     const langCode = LANG_MAP[req.body.lang] || 'en';
 
-    // Write the uploaded buffer to a temp file (preserve extension for codec detection)
-    const ext        = resolveExt(req.file);
-    const rawPath    = path.join(os.tmpdir(), `rec_${Date.now()}${ext}`);
+    const ext     = resolveExt(req.file);
+    const rawPath = path.join(os.tmpdir(), `rec_${Date.now()}${ext}`);
     fs.writeFileSync(rawPath, req.file.buffer);
     tmpFiles.push(rawPath);
 
-    // Decide which file path to actually send to Groq
-    let sendPath = rawPath;
-
-    if (req.file.buffer.length > GROQ_MAX_BYTES) {
-      console.log(
-        `[transcribe] File is ${(req.file.buffer.length / 1024 / 1024).toFixed(1)} MB ` +
-        `— compressing to 32 kbps mono MP3 with ffmpeg…`
-      );
-      const compressedPath = await compressAudio(rawPath);
-      tmpFiles.push(compressedPath);
-
-      const compressedSize = fs.statSync(compressedPath).size;
-      console.log(`[transcribe] Compressed to ${(compressedSize / 1024 / 1024).toFixed(1)} MB`);
-
-      if (compressedSize > GROQ_MAX_BYTES) {
-        // Even after heavy compression it's still too big — tell the user
-        cleanup();
-        return res.status(413).json({
-          error:
-            `Even after compression your file is ${(compressedSize / 1024 / 1024).toFixed(0)} MB. ` +
-            `Groq Whisper's limit is 25 MB. Please trim the recording to under ~8 hours of speech.`,
-        });
-      }
-
-      sendPath = compressedPath;
+    let duration;
+    try {
+      duration = await getDuration(rawPath);
+    } catch (probeErr) {
+      console.warn('[transcribe] ffprobe failed:', probeErr.message);
+      duration = 0;
     }
 
-    const result = await groq.audio.transcriptions.create({
-      file:            fs.createReadStream(sendPath),
-      model:           'whisper-large-v3',
-      language:        langCode,
-      response_format: 'json',
-    });
+    if (duration > MAX_DURATION_SEC) {
+      cleanup();
+      const hrs = (duration / 3600).toFixed(1);
+      return res.status(413).json({
+        error: `Audio is ${hrs} hours long. Maximum allowed duration is 8 hours.`,
+      });
+    }
 
-    res.json({ text: result.text || '', language: langCode });
+    console.log(
+      `[transcribe] ${(req.file.buffer.length / 1024 / 1024).toFixed(1)} MB upload` +
+      (duration ? `, ${(duration / 60).toFixed(1)} min` : '') +
+      ' — compressing…',
+    );
+
+    const compressedPath = await compressAudio(rawPath);
+    tmpFiles.push(compressedPath);
+
+    const compressedSize = fs.statSync(compressedPath).size;
+    const compressedDuration = await getDuration(compressedPath);
+
+    if (compressedDuration > MAX_DURATION_SEC) {
+      cleanup();
+      return res.status(413).json({
+        error: 'Audio exceeds the 8 hour maximum duration.',
+      });
+    }
+
+    console.log(
+      `[transcribe] Compressed to ${(compressedSize / 1024 / 1024).toFixed(1)} MB` +
+      ` (${(compressedDuration / 60).toFixed(1)} min)`,
+    );
+
+    let fullText;
+
+    if (compressedSize <= GROQ_MAX_BYTES) {
+      fullText = await transcribeFile(groq, compressedPath, langCode);
+    } else {
+      const chunks = await splitIntoChunks(compressedPath, tmpFiles);
+      console.log(`[transcribe] Split into ${chunks.length} chunks for Groq Whisper`);
+
+      const parts = [];
+      for (let i = 0; i < chunks.length; i++) {
+        console.log(`[transcribe] Chunk ${i + 1}/${chunks.length}…`);
+        const text = await transcribeFile(groq, chunks[i], langCode);
+        if (text) parts.push(text);
+      }
+      fullText = parts.join(' ');
+    }
+
+    res.json({
+      text:     fullText,
+      language: langCode,
+      duration: compressedDuration || duration || null,
+      chunks:   compressedSize > GROQ_MAX_BYTES
+        ? Math.ceil((compressedDuration || duration) / CHUNK_DURATION_SEC)
+        : 1,
+    });
   } catch (err) {
     console.error('Whisper transcription error:', err?.message || err);
     res.status(500).json({ error: err?.message || 'Transcription failed.' });

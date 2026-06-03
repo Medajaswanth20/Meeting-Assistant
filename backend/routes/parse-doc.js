@@ -1,9 +1,9 @@
-const express  = require('express');
-const multer   = require('multer');
-const mammoth  = require('mammoth');
-const xlsx     = require('xlsx');
+const express = require('express');
+const multer = require('multer');
+const mammoth = require('mammoth');
+const xlsx = require('xlsx');
 const pdfParse = require('pdf-parse');
-const path     = require('path');
+const path = require('path');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 30 * 1024 * 1024 } });
@@ -34,7 +34,7 @@ router.post('/', upload.single('file'), async (req, res) => {
     } else if (ext === '.pptx' || ext === '.ppt') {
       // Extract text from PPTX slide XML using xlsx (which bundles jszip)
       const JSZip = require('jszip');
-      const zip   = await JSZip.loadAsync(buffer);
+      const zip = await JSZip.loadAsync(buffer);
       const slideFiles = Object.keys(zip.files)
         .filter(f => f.startsWith('ppt/slides/slide') && f.endsWith('.xml'))
         .sort();
