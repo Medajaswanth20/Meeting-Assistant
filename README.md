@@ -31,7 +31,7 @@
 |---|---|
 | Node.js + Express | REST API server |
 | Groq SDK | Whisper transcription + LLaMA analysis |
-| fluent-ffmpeg | Audio compression (large file handling) |
+| fluent-ffmpeg | Audio compression & chunking (large file handling) |
 | Multer | File upload handling |
 | docx | Word document generation |
 | mammoth / pdf-parse / xlsx | Document parsing |
@@ -45,7 +45,7 @@ meeting-assistant/
 ├── backend/
 │   ├── index.js              # Express server entry point
 │   ├── routes/
-│   │   ├── transcribe.js     # Audio upload & transcription
+│   │   ├── transcribe.js     # Audio upload, compression & transcription
 │   │   ├── analyze.js        # AI meeting analysis
 │   │   ├── export.js         # Word document generation
 │   │   └── parse-doc.js      # Document text extraction
@@ -56,11 +56,11 @@ meeting-assistant/
 │   └── src/
 │       ├── App.jsx            # Main app & step routing
 │       └── components/
-│           ├── MeetingDetails.jsx   # Step 1: Meeting info
-│           ├── AudioRecorder.jsx    # Step 2: Record/upload audio
-│           ├── TranscriptStep.jsx   # Step 3: Review transcript
-│           ├── SummaryStep.jsx      # Step 4: AI analysis & editing
-│           └── ExportStep.jsx       # Step 5: Export to Word
+│           ├── StepIndicator.jsx    # Progress stepper
+│           ├── AudioRecorder.jsx    # Step 1: Record/upload audio & notes
+│           ├── MeetingDetails.jsx   # Step 2: Meeting info
+│           ├── SummaryStep.jsx      # Step 3: AI analysis & editing
+│           └── ExportStep.jsx       # Step 4: Export to Word
 │
 └── README.md
 ```
@@ -95,7 +95,7 @@ Create a `.env` file inside `backend/`:
 
 ```env
 GROQ_API_KEY=your_free_groq_api_key_here
-PORT=5000
+PORT=3001
 ```
 
 Start the backend:
@@ -104,7 +104,7 @@ Start the backend:
 npm run dev
 ```
 
-Backend runs on → `http://localhost:5000`
+Backend runs on → `http://localhost:3001`
 
 ---
 
@@ -125,12 +125,24 @@ Frontend runs on → `http://localhost:5173`
 ## 🔄 How It Works
 
 ```
-Step 1 → Enter meeting title & participants
-Step 2 → Record live audio OR upload an audio file
-Step 3 → Review & edit the auto-generated transcript
-Step 4 → AI analyzes and extracts structured insights
-Step 5 → Export polished meeting report as Word (.docx)
+Step 1 → Record live audio OR upload an audio file (edit transcript inline)
+Step 2 → Enter meeting title & participants
+Step 3 → AI analyzes and extracts structured insights
+Step 4 → Export polished meeting report as Word (.docx)
 ```
+
+---
+
+## 🎵 Audio Upload & Transcription
+
+| Limit | Value |
+|---|---|
+| Max duration | **8 hours** |
+| Max file size | **500 MB** |
+| Supported formats | MP3, WAV, M4A, OGG, FLAC, WebM, MP4 |
+| Languages | English, Hindi, Kannada, Telugu |
+
+Long recordings are automatically **compressed** to speech-friendly MP3 and **split into ~90-minute chunks** before being sent to Groq Whisper (25 MB API limit per request). Transcripts from all chunks are merged into one result.
 
 ---
 
@@ -139,7 +151,7 @@ Step 5 → Export polished meeting report as Word (.docx)
 | Variable | Required | Description |
 |---|---|---|
 | `GROQ_API_KEY` | ✅ Yes | Free API key from [console.groq.com](https://console.groq.com) |
-| `PORT` | ❌ Optional | Backend port (default: `5000`) |
+| `PORT` | ❌ Optional | Backend port (default: `3001`) |
 
 > ⚠️ **Never commit your `.env` file.** It is already excluded via `.gitignore`.
 
@@ -153,6 +165,7 @@ Step 5 → Export polished meeting report as Word (.docx)
 | `POST` | `/api/analyze` | Send transcript/notes → returns AI summary |
 | `POST` | `/api/export` | Send summary data → returns `.docx` file |
 | `POST` | `/api/parse-doc` | Upload document → returns extracted text |
+| `GET` | `/api/health` | Health check |
 
 ---
 
